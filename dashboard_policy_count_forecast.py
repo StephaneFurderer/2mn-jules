@@ -6,6 +6,7 @@ import numpy as np
 import json
 import os
 import plotly.graph_objects as go
+import shutil
 
 import frequency_development as fd
 from frequency_development.constants import *
@@ -63,6 +64,62 @@ def safe_write_config(config_path, data):
         if os.path.exists(config_path + '.bak'):
             shutil.copy2(config_path + '.bak',config_path)
             print("Restored config from backup")
+
+def _save_csv_no_duplicates(filepath, new_df, key_columns):
+    """
+    Append new_df to filepath, but remove any existing rows with the same key_columns as in new_df.
+    """
+    if os.path.exists(filepath):
+        existing_df = pd.read_csv(filepath)
+        # Remove rows that match any (segment, cutoff, cutoff_finance) in new_df
+        mask = ~existing_df.set_index(key_columns).index.isin(new_df.set_index(key_columns).index)
+        combined_df = pd.concat([existing_df[mask], new_df], ignore_index=True)
+    else:
+        combined_df = new_df
+    combined_df.to_csv(filepath, index=False)
+
+
+def save_data(segment, cutoff_date, cutoff_date_finance, past_future_pol_cohorts, per_app_date_, results_path="_results"):
+    if not os.path.exists(results_path):
+        os.makedirs(results_path)
+    cutoff_date = pd.to_datetime(cutoff_date)
+    cutoff_str = str(cutoff_date)
+
+    r1_df = past_future_pol_cohorts.copy()
+    r2_df = per_app_date_.copy()
+    for df in [r1_df, r2_df]:
+        df[SEGMENT] = segment
+        df['cutoff'] = cutoff_str
+        df['cutoff_finance'] = cutoff_date_finance
+
+    _save_csv_no_duplicates(
+        os.path.join(results_path, 'pol_count_per_dep_.csv'),
+        r1_df,
+        [SEGMENT, 'cutoff', 'cutoff_finance']
+    )
+    _save_csv_no_duplicates(
+        os.path.join(results_path, 'pol_count_per_app_.csv'),
+        r2_df,
+        [SEGMENT, 'cutoff', 'cutoff_finance']
+    )
+
+
+def save_data_tm(segment, cutoff_date, cutoff_date_finance, past_future_pol_cohorts, results_path="_results"):
+    if not os.path.exists(results_path):
+        os.makedirs(results_path)
+    cutoff_date = pd.to_datetime(cutoff_date)
+    cutoff_str = str(cutoff_date)
+
+    r1_df = past_future_pol_cohorts.copy()
+    r1_df[SEGMENT] = segment
+    r1_df['cutoff'] = cutoff_str
+    r1_df['cutoff_finance'] = cutoff_date_finance
+
+    _save_csv_no_duplicates(
+        os.path.join(results_path, 'pol_count_per_dep_.csv'),
+        r1_df,
+        [SEGMENT, 'cutoff', 'cutoff_finance']
+    )
 
 # Sidebar controls
 st.sidebar.title("Controls")
@@ -170,7 +227,13 @@ if allowed_dates_finance_str:
 else:
     st.warning("No valid date folders found in input_finance")
 
-
+existing_df = pd.read_csv(os.path.join(results_path, 'pol_count_per_dep_.csv'))
+if not existing_df.empty:
+    st.sidebar.write("Already saved results:")
+    st.sidebar.dataframe(existing_df[[SEGMENT, 'cutoff', 'cutoff_finance']].drop_duplicates())
+else:
+    st.sidebar.write("No results saved yet.")
+    
 irrelevant = ['Unknown','Tripmate','Timeshare','Expedia',"TripMate","Identity Theft"]
 list_segments= policies_df[~policies_df[SEGMENT].isin(irrelevant)][SEGMENT].unique()
 
@@ -368,6 +431,12 @@ if save_all_mode:
     if st.sidebar.button("Save All Results"):
         st.sidebar.write("Saving all segments with their configurations...")
         for segment in list_segments:
+             # Check if already saved
+            if ((existing_df[SEGMENT] == segment) & 
+                (existing_df['cutoff'] == cutoff_date) & 
+                (existing_df['cutoff_finance'] == cutoff_date_finance)).any():
+                st.sidebar.info(f"Skipping {segment} (already saved for this cutoff/cutoff_finance)")
+                continue
             st.sidebar.write(f"Processing segment: {segment}")
             if block == "CSA":
                 try:
