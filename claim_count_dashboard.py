@@ -1,4 +1,134 @@
 
+
+
+
+import pandas as pd
+import numpy as np
+from policy_count_forecast import select_main_development_info, _select_development_to_forecast, _develop_future_cohorts
+from dateutil.relativedelta import relativedelta
+
+def calculate_month_difference(start_date_column, end_date_column, row):
+    start_date = row[start_date_column]
+    end_date = row[end_date_column]
+    if pd.isna(start_date) or pd.isna(end_date):
+        return None
+    return relativedelta(end_date, start_date).years * 12 + relativedelta(end_date, start_date).months
+
+def dep_to_received_claims_cohorts(df: pd.DataFrame) -> pd.DataFrame:
+    grouped_df = df.groupby(['dateDepart_EndOfMonth', 'dateReceived_EndOfMonth'], as_index=False).agg({'clmNum_unique': 'sum'}).sort_values(['dateDepart_EndOfMonth', 'dateReceived_EndOfMonth'])
+    for col in ['dateDepart_EndOfMonth', 'dateReceived_EndOfMonth']:
+        grouped_df[f"{col}_str"] = grouped_df[col].astype("str")
+    grouped_df["clm_past_present"] = "past"
+    return grouped_df
+
+def analyze_claims_forecast(
+    segment,
+    cutoff_date,
+    cutoff_date_finance,
+    cutoff_date_frequency,
+    policies_df,
+    claims_df,
+    past_future_pol_cohorts_,
+    frequency_from_file_df_
+):
+    # Prepare claims_df_seg
+    claims_df_seg = claims_df[claims_df['segment'] == segment].copy()
+    claims_df_seg = claims_df_seg.groupby(['departureDate', 'receivedDate', 'dateDepart_EndOfMonth', 'dateReceived_EndOfMonth']).agg({'clmNum_unique': "sum"}).reset_index()
+
+    claims_df_seg["depart_to_receive_month"] = claims_df_seg.apply(lambda row: calculate_month_difference('departureDate', 'receivedDate', row), axis=1)
+    claims_df_seg["dateDepart"] = pd.to_datetime(claims_df_seg["dateDepart_EndOfMonth"])
+    claims_df_seg["dateReceived"] = pd.to_datetime(claims_df_seg["dateReceived_EndOfMonth"])
+    claims_df_seg["dateDepart_EndOfMonth"] = pd.to_datetime(claims_df_seg["dateDepart_EndOfMonth"])
+    claims_df_seg["dateReceived_EndOfMonth"] = pd.to_datetime(claims_df_seg["dateReceived_EndOfMonth"])
+
+    past_future_pol_cohorts_["dateDepart_EndOfMonth"] = pd.to_datetime(past_future_pol_cohorts_["dateDepart_EndOfMonth"])
+    frequency_from_file_df_["dateDepart_EndOfMonth"] = pd.to_datetime(frequency_from_file_df_["dateDepart_EndOfMonth"])
+
+    past_future_pol_cohorts_df_with_freq = pd.merge(
+        past_future_pol_cohorts_,
+        frequency_from_file_df_[["dateDepart_EndOfMonth", "final_weighted_freq"]],
+        how="left",
+        on="dateDepart_EndOfMonth"
+    )
+
+    past_future_pol_cohorts_df_with_freq["clmNum_unique_"] = past_future_pol_cohorts_df_with_freq["idpol_unique_"] * past_future_pol_cohorts_df_with_freq["final_weighted_freq"]
+
+    # Development pattern selection
+    month_diff_column_name = "depart_to_receive_month"
+    level = 0.95
+    metric_column_name = "clmNum_unique"
+    metric_column_name_output = "clmNum_unique_"
+    start_date_column = "dateDepart"
+    end_date_column = "dateReceived"
+    past_futurename = "clm_past_present"
+    method_dep_to_rec = "month"
+    df_copy = claims_df_seg.copy()
+    training_df = claims_df_seg.copy()
+    extraction_date = pd.to_datetime(cutoff_date)
+
+    monthly_dev_patterns, selected_pattern, dynamic_cols, dynamic_cols_end = select_main_development_info(
+        df_copy,
+        start_date_column=start_date_column,
+        end_date_column=end_date_column,
+        month_diff_column_name=month_diff_column_name,
+        metric_column_name=metric_column_name,
+        level=level,
+        method=method_dep_to_rec
+    )
+
+    selected_development = _select_development_to_forecast(selected_pattern, month_diff_column_name, dynamic_cols, method_dep_to_rec)
+
+    # Step 5: forecast future claims from dep to receive
+    future_claims_cohort_df_ = _develop_future_cohorts(
+        past_future_pol_cohorts_df_with_freq,
+        selected_development,
+        month_diff_column_name,
+        method=method_dep_to_rec,
+        start_date_eom=dynamic_cols["start_date_eom"],
+        start_date_month=dynamic_cols["start_date_month"],
+        end_date_eom=dynamic_cols_end["end_date_eom"],
+        metric_column_name=metric_column_name_output,
+        past_futurename=past_futurename,
+        metric_column_name_output=metric_column_name_output,
+        additional_group_col=None
+    )
+
+    # Step 6: get clean past cohorts:
+    past_claims_cohort_df = dep_to_received_claims_cohorts(training_df[training_df["dateReceived"] <= extraction_date])
+
+    # Step 6: get final cohorts to compute non reported yet claims
+    past_future_claims_cohort_df_ = future_claims_cohort_df_.copy()
+    past_future_claims_cohort_df_["clm_past_present"] = np.where(past_future_claims_cohort_df_["dateDepart_EndOfMonth"] > extraction_date, "future", "past")
+
+    # Prepare final_claims_rec_data
+    start_x_axis = max(pd.to_datetime("2021-01-01"), past_future_claims_cohort_df_["dateReceived_EndOfMonth"].min())
+    end_x_axis = min(pd.to_datetime("2027-12-31"), past_future_claims_cohort_df_["dateReceived_EndOfMonth"].max())
+    final_claims_rec_data = past_future_claims_cohort_df_[past_future_claims_cohort_df_["dateReceived_EndOfMonth"] >= start_x_axis].groupby(["dateReceived_EndOfMonth"], as_index=False).agg({"clmNum_unique_": "sum"})
+    final_claims_rec_data["segment"] = segment
+    final_claims_rec_data["cutoff"] = pd.to_datetime(cutoff_date)
+    final_claims_rec_data["cutoff_finance"] = pd.to_datetime(cutoff_date_finance)
+    final_claims_rec_data["cutoff_frequency"] = pd.to_datetime(cutoff_date_frequency)
+    final_claims_rec_data = final_claims_rec_data[["cutoff", "cutoff_finance", "cutoff_frequency", "segment", "dateReceived_EndOfMonth", "clmNum_unique_"]]
+
+    # Prepare final_claims_dep_data
+    final_claims_dep_data = past_future_claims_cohort_df_[past_future_claims_cohort_df_["dateDepart_EndOfMonth"] >= start_x_axis].groupby(["dateDepart_EndOfMonth"], as_index=False).agg({"clmNum_unique_": "sum"})
+    final_claims_dep_data["segment"] = segment
+    final_claims_dep_data["cutoff"] = pd.to_datetime(cutoff_date)
+    final_claims_dep_data["cutoff_finance"] = pd.to_datetime(cutoff_date_finance)
+    final_claims_dep_data["cutoff_frequency"] = pd.to_datetime(cutoff_date_frequency)
+    final_claims_dep_data = final_claims_dep_data[["cutoff", "cutoff_finance", "cutoff_frequency", "segment", "dateDepart_EndOfMonth", "clmNum_unique_"]]
+
+    # Prepare past_future_claims_cohort_df_for_semantic_model
+    past_future_claims_cohort_df_for_semantic_model = past_future_claims_cohort_df_[["cutoff", "cutoff_finance", "cutoff_frequency", "segment", "clm_past_present", "dateDepart_EndOfMonth", "dateReceived_EndOfMonth", "clmNum_unique_"]].copy()
+
+    return final_claims_rec_data, final_claims_dep_data, past_future_claims_cohort_df_for_semantic_model 
+
+
+
+
+
+
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
